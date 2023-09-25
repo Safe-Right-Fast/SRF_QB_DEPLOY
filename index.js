@@ -27,17 +27,8 @@ const configurationFile = new Configstore(pkg.name);
 
 // Load enums/commands
 const ENUMS = require('./lib/enums');
+const { forEach } = require('lodash');
 require('dotenv').config();
-
-
-// Now you can access the environment variables like this:
-const userToken = process.env.USERTOKEN;
-const appToken = process.env.APP_TOKEN;
-const devUserToken = process.env.DEV_USERTOKEN;
-const devAppToken = process.env.DEV_APP_TOKEN;
-
-// Use the variables as needed in your script
-
 
 /**
  * Runs the main logic for the CLI Script
@@ -62,15 +53,6 @@ const run = async () => {
 
     const repositoryId = process.env.REPOSITORY_ID;
 
-    // Set user token and app token in secure storage
-    const usertoken = process.env.USERTOKEN;
-    const apptoken = process.env.APP_TOKEN;
-
-    // Set development user and app tokens if required
-    if (process.env.DEV_AND_PROD_QB_APPS === 'yes') {
-      const devUserToken = process.env.DEV_USERTOKEN;
-      const devAppToken =  process.env.DEV_APP_TOKEN;
-    }
 
     if (!process.env.CUSTOM_PREFIX) {
       process.env.CUSTOM_PREFIX = 'D';
@@ -169,14 +151,17 @@ const run = async () => {
       // Add the appropriate extension prefix to each file depending on whether it is dev/prod deployment
       let indexFileName = null;
       const formattedFiles = arrayOfFileContents.map(([fileName, fileContents, isIndexFile]) => {
+
         if (isIndexFile) {
           indexFileName = fileName;
         }
         return [`${prefix}${fileName}`, fileContents];
       });
-
       // Handle API calls to deploy files
-      await handleAPICalls(deploymentType, formattedFiles, existingQbCliConfigs);
+      for(i = 0; i < formattedFiles.length; i++) {
+        await handleAPICalls(deploymentType, formattedFiles[i], existingQbCliConfigs);
+      };
+
     } catch (err) {
       alert.error(
         'Please check your qbcli.json in the root of your project. Make sure you have mapped the correct path to all of the files you are trying to deploy. Also, check all filenames match what is in those directories and make sure those files have content (this tool will not deploy blank files - add a comment if you would like to deploy without code).'
@@ -365,29 +350,38 @@ const editPrefix = async (args, qbCliJsonExists, existingQbCliConfigs, configura
  * @param {object} existingQbCliConfigs - Existing QB CLI configurations.
  * @param {object} configurationFile - The Configstore object.
  */
-const generateLinks = async (qbCliJsonExists, existingQbCliConfigs, configurationFile) => {
+const generateLinks = async () => {
+  console.log(        process.env.LAUNCH_DEV_PAGE_ID,
+    process.env.REALM,
+    process.env.CUSTOM_PREFIX,
+    process.env.CUSTOM_PREFIX_PRODUCTION,
+    process.env.DEV_AND_PROD_QUICKBASE_APPLICATIONS )
+  const repoId = process.env.REPOSITORY_ID;
+  const qbCliJsonExists = files.fileFolderExists(path.join(process.cwd(), ENUMS.QB_CLI_FILE_NAME));
   if (qbCliJsonExists) {
-    const repoId = existingQbCliConfigs.repositoryId;
     const configs = getConfiguration(repoId);
     if (configs) {
-      const { launchDevPageId, launchProdPageId, launchFeatPageId, realm } = existingQbCliConfigs;
-      const {
-        customPrefix,
-        customPrefixProduction,
-        customPrefixFeature,
-        devAndProdQuickBaseApplications,
-      } = configs;
-
       const devLink = generateLink(
-        launchDevPageId,
-        realm,
-        customPrefix,
-        customPrefixProduction,
-        devAndProdQuickBaseApplications
+        process.env.LAUNCH_DEV_PAGE_ID,
+        process.env.REALM,
+        process.env.CUSTOM_PREFIX,
+        process.env.CUSTOM_PREFIX_PRODUCTION,
+        process.env.DEV_AND_PROD_QUICKBASE_APPLICATIONS
       );
-      const prodLink = generateLink(launchProdPageId, realm, customPrefix, customPrefixProduction);
-      const featLink = generateLink(launchFeatPageId, realm, customPrefix, customPrefixProduction, false, customPrefixFeature);
-
+      const prodLink = generateLink(
+        process.env.LAUNCH_PROD_PAGE_ID,
+        process.env.QB_REALM,
+        process.env.CUSTOM_PREFIX,
+        process.env.CUSTOM_PREFIX_PRODUCTION
+      );
+      const featLink = generateLink(
+        process.env.LAUNCH_FEAT_PAGE_ID,
+        process.env.QB_REALM,
+        process.env.CUSTOM_PREFIX,
+        process.env.CUSTOM_PREFIX_PRODUCTION,
+        false,
+        process.env.CUSTOM_PREFIX_FEATURE
+      );
       console.log('\nDevelopment Link:');
       console.log(devLink);
       console.log('\nProduction Link:');
@@ -402,6 +396,7 @@ const generateLinks = async (qbCliJsonExists, existingQbCliConfigs, configuratio
   }
 };
 
+
 /**
  * Generate a Quick Base application link.
  * @param {string} pageId - The page ID.
@@ -414,7 +409,7 @@ const generateLinks = async (qbCliJsonExists, existingQbCliConfigs, configuratio
  */
 const generateLink = (pageId, realm, customPrefix, customPrefixProduction, devAndProdQuickBaseApplications = false, customPrefixFeature) => {
   const prefix = devAndProdQuickBaseApplications ? customPrefix : customPrefixProduction;
-  return `https://${realm}.quickbase.com/db/main?a=dbpage&pageID=${pageId}&namespace=${prefix}${customPrefixFeature ? '-' + customPrefixFeature : ''}`;
+  return `${realm}/db/main?a=dbpage&pageID=${pageId}&namespace=${prefix}${customPrefixFeature ? '-' + customPrefixFeature : ''}`;
 };
 
 /**
@@ -456,7 +451,6 @@ const getAllFileContents = async (filesConf, prefix) => {
  * @returns {Promise<void>} - A promise that resolves when the deployment is complete.
  */
 const handleAPICalls = async (deploymentType, formattedFiles, existingQbCliConfigs) => {
-  console.log(existingQbCliConfigs);
   const {
     repositoryId,
     customPrefixProduction,
@@ -480,7 +474,6 @@ const handleAPICalls = async (deploymentType, formattedFiles, existingQbCliConfi
       usertoken,
       apptoken,
       formattedFiles,
-      formattedFiles[0][0],
     );
 
     status.stop();
