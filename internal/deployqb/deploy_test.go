@@ -34,6 +34,40 @@ func TestPrepareFiles(t *testing.T) {
 	}
 }
 
+func TestPrepareFilesRejectsPathsOutsideProject(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, "project")
+	if err := os.Mkdir(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(parent, "secret"), []byte("private"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	project := Project{Files: []FileConfig{{Filename: "secret", Path: ".."}}}
+	if _, err := PrepareFiles(root, project, "D_repo_"); err == nil {
+		t.Fatal("path traversal should be rejected")
+	}
+}
+
+func TestPrepareFilesRejectsSymlinksOutsideProject(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, "project")
+	if err := os.Mkdir(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(parent, "secret")
+	if err := os.WriteFile(outside, []byte("private"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(root, "linked")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	project := Project{Files: []FileConfig{{Filename: "linked"}}}
+	if _, err := PrepareFiles(root, project, "D_repo_"); err == nil {
+		t.Fatal("escaping symlink should be rejected")
+	}
+}
+
 func TestProjectAcceptsLegacyIndexString(t *testing.T) {
 	filename := filepath.Join(t.TempDir(), "qbcli.json")
 	data := `{"repositoryId":"repo","filesConf":[{"filename":"index.html","isIndexFile":"yes"}]}`

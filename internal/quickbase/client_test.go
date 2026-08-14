@@ -20,7 +20,7 @@ func TestAddReplaceDBPage(t *testing.T) {
 	}))
 	defer server.Close()
 
-	pageID, err := (Client{}).AddReplaceDBPage("db", server.URL, "u<t", "a&b", "a&b", []byte("before]]>after"))
+	pageID, err := (Client{BaseURL: server.URL}).AddReplaceDBPage("db", "acme", "u<t", "a&b", "a&b", []byte("before]]>after"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -40,9 +40,34 @@ func TestAddReplaceDBPageReportsAPIError(t *testing.T) {
 	}))
 	defer server.Close()
 
-	_, err := (Client{}).AddReplaceDBPage("db", server.URL, "token", "", "page", []byte("body"))
+	_, err := (Client{BaseURL: server.URL}).AddReplaceDBPage("db", "acme", "token", "", "page", []byte("body"))
 	if err == nil || !strings.Contains(err.Error(), "Denied") {
 		t.Fatalf("error = %v, want Denied", err)
+	}
+}
+
+func TestClientRejectsNonQuickbaseRealm(t *testing.T) {
+	_, err := (Client{}).AddReplaceDBPage("db", "https://attacker.example", "secret", "", "page", []byte("body"))
+	if err == nil || !strings.Contains(err.Error(), "Quickbase realm") {
+		t.Fatalf("error = %v, want realm rejection", err)
+	}
+}
+
+func TestClientDoesNotFollowRedirects(t *testing.T) {
+	followed := false
+	target := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { followed = true }))
+	defer target.Close()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL, http.StatusTemporaryRedirect)
+	}))
+	defer server.Close()
+
+	_, err := (Client{BaseURL: server.URL}).AddReplaceDBPage("db", "acme", "secret", "", "page", []byte("body"))
+	if err == nil || !strings.Contains(err.Error(), "307") {
+		t.Fatalf("error = %v, want redirect status", err)
+	}
+	if followed {
+		t.Fatal("redirect target received credentials")
 	}
 }
 

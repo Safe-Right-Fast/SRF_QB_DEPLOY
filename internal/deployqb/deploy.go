@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 type DeploymentFile struct {
@@ -14,14 +15,15 @@ type DeploymentFile struct {
 }
 
 func Prefix(project Project, personal PersonalProject, environment string) (string, error) {
-	prefix := map[string]string{
-		"dev":  project.DevPrefix,
-		"prod": project.ProdPrefix,
-		"feat": personal.FeaturePrefix,
-	}[environment]
-	defaults := map[string]string{"dev": "D", "prod": "P", "feat": "F"}
-	fallback, ok := defaults[environment]
-	if !ok {
+	prefix, fallback := "", ""
+	switch environment {
+	case "dev":
+		prefix, fallback = project.DevPrefix, "D"
+	case "prod":
+		prefix, fallback = project.ProdPrefix, "P"
+	case "feat":
+		prefix, fallback = personal.FeaturePrefix, "F"
+	default:
 		return "", fmt.Errorf("unknown environment %q", environment)
 	}
 	if prefix == "" {
@@ -31,9 +33,21 @@ func Prefix(project Project, personal PersonalProject, environment string) (stri
 }
 
 func PrepareFiles(root string, project Project, prefix string) ([]DeploymentFile, error) {
+	root, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return nil, err
+	}
 	prepared := make([]DeploymentFile, 0, len(project.Files))
 	for _, file := range project.Files {
-		body, err := os.ReadFile(filepath.Join(root, file.Path, file.Filename))
+		filename, err := filepath.EvalSymlinks(filepath.Join(root, file.Path, file.Filename))
+		if err != nil {
+			return nil, fmt.Errorf("read %s: %w", file.Filename, err)
+		}
+		relative, err := filepath.Rel(root, filename)
+		if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+			return nil, fmt.Errorf("%s resolves outside the project root", file.Filename)
+		}
+		body, err := os.ReadFile(filename)
 		if err != nil {
 			return nil, fmt.Errorf("read %s: %w", file.Filename, err)
 		}
