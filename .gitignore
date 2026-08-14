@@ -1,5 +1,5 @@
-node_modules/
-build/
-qbcli.json
-deploy/
 .env
+build/
+deploy/
+deployqb
+qbcli.json
