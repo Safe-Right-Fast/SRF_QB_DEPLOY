@@ -29,8 +29,13 @@ func LoadDotEnv(filename string) error {
 			return fmt.Errorf("invalid .env line %q", line)
 		}
 		key, value = strings.TrimSpace(key), strings.TrimSpace(value)
-		if len(value) >= 2 && ((value[0] == '"' && value[len(value)-1] == '"') || (value[0] == '\'' && value[len(value)-1] == '\'')) {
-			value = value[1 : len(value)-1]
+		if len(value) > 0 && (value[0] == '"' || value[0] == '\'') {
+			quote := value[0]
+			if end := strings.IndexByte(value[1:], quote); end >= 0 {
+				value = value[1 : end+1]
+			}
+		} else if comment := strings.IndexByte(value, '#'); comment >= 0 {
+			value = strings.TrimSpace(value[:comment])
 		}
 		if _, exists := os.LookupEnv(key); !exists {
 			if err := os.Setenv(key, value); err != nil {
@@ -46,10 +51,10 @@ func ProjectFromEnv() (Project, error) {
 		RepositoryID:                    os.Getenv("REPOSITORY_ID"),
 		ProdPrefix:                      envOr("CUSTOM_PREFIX_PRODUCTION", "P"),
 		DevPrefix:                       envOr("CUSTOM_PREFIX", "D"),
-		DBID:                            os.Getenv("QB_DBID"),
-		DevDBID:                         os.Getenv("QB_DEV_DBID"),
+		DBID:                            envOr("QB_DBID", os.Getenv("DBID")),
+		DevDBID:                         envOr("QB_DEV_DBID", os.Getenv("DEV_DBID")),
 		DevAndProdQuickBaseApplications: envOr("DEV_AND_PROD_QUICKBASE_APPLICATIONS", "no"),
-		Realm:                           os.Getenv("QB_REALM"),
+		Realm:                           envOr("QB_REALM", os.Getenv("REALM")),
 		Files:                           []FileConfig{},
 	}
 	var missing []string

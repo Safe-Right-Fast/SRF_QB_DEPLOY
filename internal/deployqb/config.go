@@ -27,8 +27,6 @@ func (b *FlexibleBool) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-func (b FlexibleBool) MarshalJSON() ([]byte, error) { return json.Marshal(bool(b)) }
-
 type FileConfig struct {
 	Filename     string       `json:"filename"`
 	Path         string       `json:"path,omitempty"`
@@ -51,7 +49,7 @@ type Project struct {
 }
 
 type PersonalProject struct {
-	FeaturePrefix    string `json:"featurePrefix"`
+	FeaturePrefix    string `json:"customPrefixFeature"`
 	LaunchFeatPageID int    `json:"launchFeatPageId,omitempty"`
 }
 
@@ -76,7 +74,7 @@ func PersonalConfigPath() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(dir, "deployqb", "config.json"), nil
+	return filepath.Join(dir, "configstore", "deployqb.json"), nil
 }
 
 func LoadPersonal(filename string) (PersonalConfig, error) {

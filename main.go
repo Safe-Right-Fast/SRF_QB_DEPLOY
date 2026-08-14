@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"os/exec"
 	"runtime"
@@ -79,7 +80,9 @@ func initProject() error {
 		return err
 	}
 	entry := personal[project.RepositoryID]
-	entry.FeaturePrefix = envOr("CUSTOM_PREFIX_FEATURE", "F")
+	if entry.FeaturePrefix == "" {
+		entry.FeaturePrefix = envOr("CUSTOM_PREFIX_FEATURE", "F")
+	}
 	personal[project.RepositoryID] = entry
 	if err := deployqb.SavePersonal(filename, personal); err != nil {
 		return err
@@ -126,11 +129,13 @@ func deploy(environment string) error {
 	}
 
 	separateDevApp := project.DevAndProdQuickBaseApplications == "yes" && environment != "prod"
-	dbid, userToken, appToken := project.DBID, os.Getenv("QB_USERTOKEN"), os.Getenv("QB_APP_TOKEN")
+	dbid := project.DBID
+	userToken := envOr("QB_USERTOKEN", os.Getenv("USERTOKEN"))
+	appToken := envOr("QB_APP_TOKEN", os.Getenv("APP_TOKEN"))
 	if separateDevApp {
 		dbid = project.DevDBID
-		userToken = envOr("QB_DEV_USERTOKEN", userToken)
-		appToken = envOr("QB_DEV_APP_TOKEN", appToken)
+		userToken = envOr("QB_DEV_USERTOKEN", envOr("DEV_USERTOKEN", userToken))
+		appToken = envOr("QB_DEV_APP_TOKEN", envOr("DEV_APP_TOKEN", appToken))
 	}
 	if dbid == "" || userToken == "" {
 		return errors.New("selected environment is missing a DBID or user token")
@@ -187,11 +192,21 @@ func launch(environment string) error {
 	if pageID == 0 {
 		return fmt.Errorf("deploy %s with an isIndexFile entry before launching it", environment)
 	}
-	address := fmt.Sprintf("%s/db/%s?a=dbpage&pageID=%d", quickbase.NormalizeRealm(project.Realm), dbid, pageID)
-	if query := strings.TrimLeft(project.URLQueryString, "?&"); query != "" {
-		address += "&" + query
+	address, err := launchAddress(project.Realm, dbid, pageID, project.URLQueryString)
+	if err != nil {
+		return err
 	}
 	return openBrowser(address)
+}
+
+func launchAddress(realm, dbid string, pageID int, rawQuery string) (string, error) {
+	query, err := url.ParseQuery(strings.TrimLeft(rawQuery, "?&"))
+	if err != nil {
+		return "", fmt.Errorf("invalid urlQueryString: %w", err)
+	}
+	query.Set("a", "dbpage")
+	query.Set("pageID", fmt.Sprint(pageID))
+	return fmt.Sprintf("%s/db/%s?%s", quickbase.NormalizeRealm(realm), url.PathEscape(dbid), query.Encode()), nil
 }
 
 func editFeaturePrefix() error {

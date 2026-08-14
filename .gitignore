@@ -1,5 +1,5 @@
 .env
 build/
 deploy/
-deployqb
+/deployqb
 qbcli.json
