@@ -2,6 +2,7 @@ package deployqb
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -12,6 +13,12 @@ type DeploymentFile struct {
 	Name    string
 	Body    []byte
 	IsIndex bool
+}
+
+type resolvedFile struct {
+	config FileConfig
+	path   string
+	body   []byte
 }
 
 func Prefix(project Project, personal PersonalProject, environment string) (string, error) {
@@ -37,17 +44,13 @@ func PrepareFiles(root string, project Project, prefix string) ([]DeploymentFile
 	if err != nil {
 		return nil, err
 	}
-	prepared := make([]DeploymentFile, 0, len(project.Files))
-	for _, file := range project.Files {
-		filename, err := filepath.EvalSymlinks(filepath.Join(root, file.Path, file.Filename))
+	resolved := make([]resolvedFile, len(project.Files))
+	for index, file := range project.Files {
+		path, err := resolveSource(root, file)
 		if err != nil {
-			return nil, fmt.Errorf("read %s: %w", file.Filename, err)
+			return nil, err
 		}
-		relative, err := filepath.Rel(root, filename)
-		if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
-			return nil, fmt.Errorf("%s resolves outside the project root", file.Filename)
-		}
-		body, err := os.ReadFile(filename)
+		body, err := os.ReadFile(path)
 		if err != nil {
 			return nil, fmt.Errorf("read %s: %w", file.Filename, err)
 		}
@@ -55,14 +58,65 @@ func PrepareFiles(root string, project Project, prefix string) ([]DeploymentFile
 		if len(body) == 0 {
 			return nil, fmt.Errorf("%s is empty", file.Filename)
 		}
-		for _, dependencyIndex := range file.Dependencies {
-			if dependencyIndex < 0 || dependencyIndex >= len(project.Files) {
-				return nil, fmt.Errorf("%s has invalid dependency index %d", file.Filename, dependencyIndex)
+		resolved[index] = resolvedFile{config: file, path: path, body: body}
+	}
+
+	prepared := make([]DeploymentFile, 0, len(resolved))
+	for _, file := range resolved {
+		body := file.body
+		for _, dependencyIndex := range file.config.Dependencies {
+			if dependencyIndex < 0 || dependencyIndex >= len(resolved) {
+				return nil, fmt.Errorf("%s has invalid dependency index %d", file.config.Filename, dependencyIndex)
 			}
-			dependency := project.Files[dependencyIndex].Filename
-			body = bytes.ReplaceAll(body, []byte("pagename="+dependency), []byte("pagename="+prefix+dependency))
+			dependency := resolved[dependencyIndex]
+			pageName := prefix + dependency.config.Filename
+			body = bytes.ReplaceAll(body, []byte("pagename="+dependency.config.Filename), []byte("pagename="+pageName))
+			if dependency.config.Source != "" {
+				body = rewriteBuiltAsset(body, file.path, dependency, pageName)
+			}
 		}
-		prepared = append(prepared, DeploymentFile{Name: prefix + file.Filename, Body: body, IsIndex: bool(file.IsIndexFile)})
+		prepared = append(prepared, DeploymentFile{Name: prefix + file.config.Filename, Body: body, IsIndex: bool(file.config.IsIndexFile)})
 	}
 	return prepared, nil
+}
+
+func resolveSource(root string, file FileConfig) (string, error) {
+	source := file.Source
+	if source == "" {
+		source = file.Filename
+	}
+	pattern := filepath.Join(root, file.Path, source)
+	matches, err := filepath.Glob(pattern)
+	if err != nil {
+		return "", fmt.Errorf("source %s: %w", source, err)
+	}
+	if len(matches) != 1 {
+		return "", fmt.Errorf("%s source %q matched %d files, want 1", file.Filename, source, len(matches))
+	}
+	path, err := filepath.EvalSymlinks(matches[0])
+	if err != nil {
+		return "", fmt.Errorf("read %s: %w", file.Filename, err)
+	}
+	relative, err := filepath.Rel(root, path)
+	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("%s resolves outside the project root", file.Filename)
+	}
+	return path, nil
+}
+
+func rewriteBuiltAsset(body []byte, parentPath string, dependency resolvedFile, pageName string) []byte {
+	reference, err := filepath.Rel(filepath.Dir(parentPath), dependency.path)
+	if err != nil {
+		return body
+	}
+	reference = filepath.ToSlash(reference)
+	sum := sha256.Sum256(dependency.body)
+	pageURL := fmt.Sprintf("?a=dbpage&pagename=%s&amp;v=%x", pageName, sum[:6])
+	for _, candidate := range []string{"/" + reference, "./" + reference, reference} {
+		for _, quote := range []string{"\"", "'"} {
+			old := []byte(quote + candidate + quote)
+			body = bytes.ReplaceAll(body, old, []byte(quote+pageURL+quote))
+		}
+	}
+	return body
 }

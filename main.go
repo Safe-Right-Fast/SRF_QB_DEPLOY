@@ -4,18 +4,21 @@ import (
 	"bufio"
 	"errors"
 	"fmt"
+	"io"
 	"net/url"
 	"os"
 	"os/exec"
 	"runtime"
+	"sort"
 	"strings"
 
 	"github.com/Justin-Stockton/deployqb/internal/deployqb"
 	"github.com/Justin-Stockton/deployqb/internal/quickbase"
+	"golang.org/x/term"
 )
 
 const help = `deployqb commands
-init         Create qbcli.json from environment configuration
+init         Create or refresh qbcli.json interactively
 feat         Deploy to the feature environment
 dev          Deploy to the development environment
 prod         Deploy to the production environment
@@ -27,9 +30,6 @@ genlinks     Display dbpage links for configured files
 help         Display this help`
 
 func main() {
-	if err := deployqb.LoadDotEnv(".env"); err != nil {
-		fatal(err)
-	}
 	command := "help"
 	if len(os.Args) > 1 {
 		command = os.Args[1]
@@ -59,36 +59,243 @@ func run(command string) error {
 	}
 }
 
-func initProject() error {
-	project, err := deployqb.ProjectFromEnv()
+type initPrompter struct {
+	reader   *bufio.Reader
+	writer   io.Writer
+	terminal *os.File
+}
+
+func newInitPrompter(reader io.Reader, writer io.Writer) *initPrompter {
+	prompter := &initPrompter{reader: bufio.NewReader(reader), writer: writer}
+	if file, ok := reader.(*os.File); ok && term.IsTerminal(int(file.Fd())) {
+		prompter.terminal = file
+	}
+	return prompter
+}
+
+func (p *initPrompter) ask(label, fallback string) (string, error) {
+	if fallback == "" {
+		fmt.Fprintf(p.writer, "%s: ", label)
+	} else {
+		fmt.Fprintf(p.writer, "%s [%s]: ", label, fallback)
+	}
+	value, err := p.reader.ReadString('\n')
+	if err != nil && !errors.Is(err, io.EOF) {
+		return "", err
+	}
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return fallback, nil
+	}
+	return value, nil
+}
+
+func (p *initPrompter) askSecret(label, fallback string) (string, error) {
+	if fallback == "" {
+		fmt.Fprintf(p.writer, "%s: ", label)
+	} else {
+		fmt.Fprintf(p.writer, "%s [set]: ", label)
+	}
+	if p.terminal != nil {
+		value, err := term.ReadPassword(int(p.terminal.Fd()))
+		fmt.Fprintln(p.writer)
+		if err != nil {
+			return "", err
+		}
+		if len(value) == 0 {
+			return fallback, nil
+		}
+		return string(value), nil
+	}
+	value, err := p.reader.ReadString('\n')
+	if err != nil && !errors.Is(err, io.EOF) {
+		return "", err
+	}
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return fallback, nil
+	}
+	return value, nil
+}
+
+func initProject() error { return initProjectWithIO(os.Stdin, os.Stdout) }
+
+func initProjectWithIO(reader io.Reader, writer io.Writer) error {
+	prompter := newInitPrompter(reader, writer)
+	project, err := initialProject()
 	if err != nil {
 		return err
 	}
-	if existing, err := deployqb.LoadProject(deployqb.ProjectFilename); err == nil {
-		project.URLQueryString = existing.URLQueryString
-		project.Files = existing.Files
-		project.LaunchProdPageID = existing.LaunchProdPageID
-		project.LaunchDevPageID = existing.LaunchDevPageID
-	} else if !errors.Is(err, os.ErrNotExist) {
+	userConfig, userConfigFilename, err := loadUserConfig()
+	if err != nil {
 		return err
 	}
+
+	if project.RepositoryID, err = prompter.ask("Repository ID", firstNonEmpty(project.RepositoryID, os.Getenv("REPOSITORY_ID"))); err != nil {
+		return err
+	}
+	if project.DBID, err = prompter.ask("Production DBID", firstNonEmpty(project.DBID, envOr("QB_DBID", os.Getenv("DBID")))); err != nil {
+		return err
+	}
+	separateDefault := firstNonEmpty(project.DevAndProdQuickBaseApplications, envOr("DEV_AND_PROD_QUICKBASE_APPLICATIONS", "no"))
+	if project.DevAndProdQuickBaseApplications, err = prompter.ask("Use separate development application (yes/no)", separateDefault); err != nil {
+		return err
+	}
+	project.DevAndProdQuickBaseApplications = yesNo(project.DevAndProdQuickBaseApplications)
+	if project.DevAndProdQuickBaseApplications != "yes" && project.DevAndProdQuickBaseApplications != "no" {
+		return errors.New("separate development application must be yes or no")
+	}
+	if project.DevAndProdQuickBaseApplications == "yes" {
+		if project.DevDBID, err = prompter.ask("Development DBID", firstNonEmpty(project.DevDBID, envOr("QB_DEV_DBID", os.Getenv("DEV_DBID")))); err != nil {
+			return err
+		}
+	}
+	if project.ProdPrefix, err = prompter.ask("Production page prefix", firstNonEmpty(project.ProdPrefix, envOr("CUSTOM_PREFIX_PRODUCTION", "P"))); err != nil {
+		return err
+	}
+	if project.DevPrefix, err = prompter.ask("Development page prefix", firstNonEmpty(project.DevPrefix, envOr("CUSTOM_PREFIX", "D"))); err != nil {
+		return err
+	}
+	if project.RepositoryID == "" || project.DBID == "" {
+		return errors.New("repository ID and production DBID are required")
+	}
+	if project.DevAndProdQuickBaseApplications == "yes" && project.DevDBID == "" {
+		return errors.New("development DBID is required when using a separate development application")
+	}
+
+	prodDefaults := deployqb.Profile{
+		Realm:     firstNonEmpty(project.Realm, envOr("QB_REALM", os.Getenv("REALM"))),
+		UserToken: envOr("QB_USERTOKEN", os.Getenv("USERTOKEN")),
+		AppToken:  envOr("QB_APP_TOKEN", os.Getenv("APP_TOKEN")),
+	}
+	project.Realm = firstNonEmpty(project.Realm, prodDefaults.Realm)
+	project.ProdProfile, err = configureProfile(prompter, userConfig.Profiles, "Production", firstNonEmpty(project.ProdProfile, defaultProfile(userConfig.Profiles, "production")), prodDefaults)
+	if err != nil {
+		return err
+	}
+	if project.DevAndProdQuickBaseApplications == "yes" {
+		devDefaults := deployqb.Profile{
+			Realm:     firstNonEmpty(envOr("QB_DEV_REALM", ""), project.Realm, prodDefaults.Realm),
+			UserToken: firstNonEmpty(envOr("QB_DEV_USERTOKEN", envOr("DEV_USERTOKEN", "")), prodDefaults.UserToken),
+			AppToken:  envOr("QB_DEV_APP_TOKEN", envOr("DEV_APP_TOKEN", "")),
+		}
+		project.DevProfile, err = configureProfile(prompter, userConfig.Profiles, "Development", firstNonEmpty(project.DevProfile, "development"), devDefaults)
+		if err != nil {
+			return err
+		}
+	} else {
+		project.DevProfile = project.ProdProfile
+	}
+	if profile, ok := userConfig.Profiles[project.ProdProfile]; ok && project.Realm == "" {
+		project.Realm = profile.Realm
+	}
+	if project.Realm == "" {
+		return errors.New("a Quickbase realm is required")
+	}
+
 	if err := deployqb.SaveProject(deployqb.ProjectFilename, project); err != nil {
 		return err
 	}
-	personal, filename, err := loadPersonal()
-	if err != nil {
-		return err
-	}
+	personal := userConfig.Personal
 	entry := personal[project.RepositoryID]
 	if entry.FeaturePrefix == "" {
 		entry.FeaturePrefix = envOr("CUSTOM_PREFIX_FEATURE", "F")
 	}
 	personal[project.RepositoryID] = entry
-	if err := deployqb.SavePersonal(filename, personal); err != nil {
+	userConfig.Personal = personal
+	if err := deployqb.SaveUserConfig(userConfigFilename, userConfig); err != nil {
 		return err
 	}
-	fmt.Println("Created qbcli.json. Update filesConf with the files to deploy.")
+	fmt.Fprintln(writer, "Initialized qbcli.json. Update filesConf with the files to deploy.")
 	return nil
+}
+
+func initialProject() (deployqb.Project, error) {
+	project, err := deployqb.LoadProject(deployqb.ProjectFilename)
+	if err == nil {
+		return project, nil
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return project, err
+	}
+	return deployqb.Project{Files: []deployqb.FileConfig{}}, nil
+}
+
+func configureProfile(prompter *initPrompter, profiles map[string]deployqb.Profile, role, name string, defaults deployqb.Profile) (string, error) {
+	if profiles == nil {
+		profiles = map[string]deployqb.Profile{}
+	}
+	names := make([]string, 0, len(profiles))
+	for profileName := range profiles {
+		names = append(names, profileName)
+	}
+	sort.Strings(names)
+	if len(names) > 0 {
+		fmt.Fprintf(prompter.writer, "Existing profiles: %s\n", strings.Join(names, ", "))
+	}
+	selected, err := prompter.ask(role+" profile name", name)
+	if err != nil {
+		return "", err
+	}
+	if selected == "" {
+		return "", fmt.Errorf("%s profile name is required", strings.ToLower(role))
+	}
+	profile := defaults
+	if existing, ok := profiles[selected]; ok {
+		profile = existing
+	}
+	if profile.Realm, err = prompter.ask(role+" profile realm", profile.Realm); err != nil {
+		return "", err
+	}
+	if profile.UserToken, err = prompter.askSecret(role+" user token", profile.UserToken); err != nil {
+		return "", err
+	}
+	if profile.AppToken, err = prompter.askSecret(role+" app token", profile.AppToken); err != nil {
+		return "", err
+	}
+	if profile.UserToken == "" {
+		if prompter.terminal != nil {
+			return "", fmt.Errorf("%s user token is required", strings.ToLower(role))
+		}
+		// Keep old noninteractive setup usable when credentials are supplied later
+		// through the process environment.
+		return "", nil
+	}
+	if profile.Realm == "" {
+		return "", fmt.Errorf("%s profile realm is required", strings.ToLower(role))
+	}
+	profiles[selected] = profile
+	return selected, nil
+}
+
+func defaultProfile(profiles map[string]deployqb.Profile, fallback string) string {
+	if len(profiles) != 1 {
+		return fallback
+	}
+	for name := range profiles {
+		return name
+	}
+	return fallback
+}
+
+func yesNo(value string) string {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "y", "yes", "true":
+		return "yes"
+	case "n", "no", "false":
+		return "no"
+	default:
+		return value
+	}
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func deploy(environment string) error {
@@ -99,10 +306,11 @@ func deploy(environment string) error {
 	if len(project.Files) == 0 {
 		return errors.New("qbcli.json must list at least one file in filesConf")
 	}
-	personal, personalFilename, err := loadPersonal()
+	userConfig, userConfigFilename, err := loadUserConfig()
 	if err != nil {
 		return err
 	}
+	personal := userConfig.Personal
 	personalProject, ok := personal[project.RepositoryID]
 	if !ok {
 		return errors.New("project is not initialized; run deployqb init")
@@ -130,20 +338,20 @@ func deploy(environment string) error {
 
 	separateDevApp := project.DevAndProdQuickBaseApplications == "yes" && environment != "prod"
 	dbid := project.DBID
-	userToken := envOr("QB_USERTOKEN", os.Getenv("USERTOKEN"))
-	appToken := envOr("QB_APP_TOKEN", os.Getenv("APP_TOKEN"))
 	if separateDevApp {
 		dbid = project.DevDBID
-		userToken = envOr("QB_DEV_USERTOKEN", envOr("DEV_USERTOKEN", userToken))
-		appToken = envOr("QB_DEV_APP_TOKEN", envOr("DEV_APP_TOKEN", appToken))
 	}
-	if dbid == "" || userToken == "" {
-		return errors.New("selected environment is missing a DBID or user token")
+	realm, userToken, appToken, err := credentials(project, userConfig, separateDevApp)
+	if err != nil {
+		return err
+	}
+	if dbid == "" || realm == "" || userToken == "" {
+		return errors.New("selected environment is missing a DBID, realm, or user token")
 	}
 
 	client := quickbase.Client{}
 	for _, file := range prepared {
-		pageID, err := client.AddReplaceDBPage(dbid, project.Realm, userToken, appToken, file.Name, file.Body)
+		pageID, err := client.AddReplaceDBPage(dbid, realm, userToken, appToken, file.Name, file.Body)
 		if err != nil {
 			return fmt.Errorf("deploy %s: %w", file.Name, err)
 		}
@@ -162,11 +370,35 @@ func deploy(environment string) error {
 	if err := deployqb.SaveProject(deployqb.ProjectFilename, project); err != nil {
 		return err
 	}
-	if err := deployqb.SavePersonal(personalFilename, personal); err != nil {
+	userConfig.Personal = personal
+	if err := deployqb.SaveUserConfig(userConfigFilename, userConfig); err != nil {
 		return err
 	}
 	fmt.Printf("Deployed %d files to %s.\n", len(prepared), environment)
 	return nil
+}
+
+func credentials(project deployqb.Project, config deployqb.UserConfig, useDevelopment bool) (realm, userToken, appToken string, err error) {
+	profileName := project.ProdProfile
+	if useDevelopment {
+		profileName = project.DevProfile
+	}
+	if profileName != "" {
+		profile, ok := config.Profiles[profileName]
+		if !ok {
+			return "", "", "", fmt.Errorf("profile %q is not available; run deployqb init", profileName)
+		}
+		return profile.Realm, profile.UserToken, profile.AppToken, nil
+	}
+	realm = firstNonEmpty(project.Realm, envOr("QB_REALM", os.Getenv("REALM")))
+	if useDevelopment {
+		userToken = firstNonEmpty(userToken, envOr("QB_DEV_USERTOKEN", envOr("DEV_USERTOKEN", envOr("QB_USERTOKEN", os.Getenv("USERTOKEN")))))
+		appToken = firstNonEmpty(appToken, envOr("QB_DEV_APP_TOKEN", envOr("DEV_APP_TOKEN", envOr("QB_APP_TOKEN", os.Getenv("APP_TOKEN")))))
+	} else {
+		userToken = firstNonEmpty(userToken, envOr("QB_USERTOKEN", os.Getenv("USERTOKEN")))
+		appToken = firstNonEmpty(appToken, envOr("QB_APP_TOKEN", os.Getenv("APP_TOKEN")))
+	}
+	return realm, userToken, appToken, nil
 }
 
 func launch(environment string) error {
@@ -174,11 +406,12 @@ func launch(environment string) error {
 	if err != nil {
 		return err
 	}
-	personal, _, err := loadPersonal()
+	userConfig, _, err := loadUserConfig()
 	if err != nil {
 		return err
 	}
 	dbid, pageID := project.DBID, project.LaunchProdPageID
+	useDevelopment := project.DevAndProdQuickBaseApplications == "yes" && environment != "prod"
 	if environment != "prod" {
 		if project.DevAndProdQuickBaseApplications == "yes" {
 			dbid = project.DevDBID
@@ -186,13 +419,17 @@ func launch(environment string) error {
 		if environment == "dev" {
 			pageID = project.LaunchDevPageID
 		} else {
-			pageID = personal[project.RepositoryID].LaunchFeatPageID
+			pageID = userConfig.Personal[project.RepositoryID].LaunchFeatPageID
 		}
 	}
 	if pageID == 0 {
 		return fmt.Errorf("deploy %s with an isIndexFile entry before launching it", environment)
 	}
-	address, err := launchAddress(project.Realm, dbid, pageID, project.URLQueryString)
+	realm, _, _, err := credentials(project, userConfig, useDevelopment)
+	if err != nil {
+		return err
+	}
+	address, err := launchAddress(realm, dbid, pageID, project.URLQueryString)
 	if err != nil {
 		return err
 	}
@@ -214,11 +451,11 @@ func editFeaturePrefix() error {
 	if err != nil {
 		return err
 	}
-	personal, filename, err := loadPersonal()
+	userConfig, filename, err := loadUserConfig()
 	if err != nil {
 		return err
 	}
-	entry, ok := personal[project.RepositoryID]
+	entry, ok := userConfig.Personal[project.RepositoryID]
 	if !ok {
 		return errors.New("project is not initialized; run deployqb init")
 	}
@@ -229,8 +466,8 @@ func editFeaturePrefix() error {
 		return errors.New("prefix cannot be empty")
 	}
 	entry.FeaturePrefix = value
-	personal[project.RepositoryID] = entry
-	return deployqb.SavePersonal(filename, personal)
+	userConfig.Personal[project.RepositoryID] = entry
+	return deployqb.SaveUserConfig(filename, userConfig)
 }
 
 func generateLinks() error {
@@ -238,12 +475,12 @@ func generateLinks() error {
 	if err != nil {
 		return err
 	}
-	personal, _, err := loadPersonal()
+	userConfig, _, err := loadUserConfig()
 	if err != nil {
 		return err
 	}
 	for _, environment := range []string{"dev", "prod", "feat"} {
-		prefix, err := deployqb.Prefix(project, personal[project.RepositoryID], environment)
+		prefix, err := deployqb.Prefix(project, userConfig.Personal[project.RepositoryID], environment)
 		if err != nil {
 			return err
 		}
@@ -263,12 +500,12 @@ func loadProject() (deployqb.Project, error) {
 	return project, err
 }
 
-func loadPersonal() (deployqb.PersonalConfig, string, error) {
+func loadUserConfig() (deployqb.UserConfig, string, error) {
 	filename, err := deployqb.PersonalConfigPath()
 	if err != nil {
-		return nil, "", err
+		return deployqb.UserConfig{}, "", err
 	}
-	config, err := deployqb.LoadPersonal(filename)
+	config, err := deployqb.LoadUserConfig(filename)
 	return config, filename, err
 }
 
